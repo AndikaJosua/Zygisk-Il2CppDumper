@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cinttypes>  // ADD THIS LINE - provides PRIxPTR macro
 #include <unistd.h>
 #include <sys/system_properties.h>
 #include <dlfcn.h>
