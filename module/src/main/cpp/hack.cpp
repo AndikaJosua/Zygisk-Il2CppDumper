@@ -1,120 +1,219 @@
 //
 // Created by Perfare on 2020/7/4.
 //
-// Completely automated, non-blocking memory map scanner for Unity 6
-//
 
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "log.h"
+#include "xdl.h"
 #include <cstring>
 #include <cstdio>
-#include <cstdlib>
 #include <unistd.h>
+#include <sys/system_properties.h>
+#include <dlfcn.h>
 #include <jni.h>
 #include <thread>
-#include <chrono>
+#include <sys/mman.h>
+#include <linux/unistd.h>
+#include <array>
 #include <string>
-#include <fstream>
-#include <cctype>
-#include <cerrno>
 
-static void hack_start_maps() {
-    LOGI("Perfare: Asynchronous background maps scanning thread active (tid=%d).", gettid());
+// Fixed target destination to bypass unverified pointer parsing in the translator
+const char *STATIC_GAME_DATA_DIR = "/data/data/com.kukouri.wizworld/files";
 
-    // Explicit path setup to guarantee absolute destination stability
-    const char *game_data_dir = "/data/data/com.kukouri.wizworld/files";
-    unsigned int loop_count = 0;
-    uintptr_t base_addr = 0;
-
-    constexpr auto POLL_INTERVAL = std::chrono::milliseconds(500);
-
-    while (true) {
-        loop_count++;
-        LOGI("Perfare: Map tracking execution pass running (loop_count=%u)...", loop_count);
-
-        std::ifstream maps("/proc/self/maps");
-        if (!maps.is_open()) {
-            LOGE("Perfare: Failed to parse execution maps layout on loop %u.", loop_count);
-            std::this_thread::sleep_for(POLL_INTERVAL);
-            continue;
+void hack_start(const char *game_data_dir) {
+    LOGI("Perfare: Dumper thread active (tid=%d). Searching for libil2cpp.so...", gettid());
+    bool load = false;
+    
+    // Extended to 20 attempts to give Unity 6 ample time to unpack under translation layers
+    for (int i = 0; i < 20; i++) {
+        void *handle = xdl_open("libil2cpp.so", 0);
+        if (handle) {
+            load = true;
+            LOGI("Perfare: libil2cpp.so found via xdl_open! Initializing core pipeline...");
+            il2cpp_api_init(handle);
+            il2cpp_dump(STATIC_GAME_DATA_DIR);
+            LOGI("Perfare: SUCCESS! Extraction completed cleanly.");
+            break;
+        } else {
+            sleep(1);
         }
+    }
+    if (!load) {
+        LOGE("Perfare: libil2cpp.so not found in thread %d after timeout.", gettid());
+    }
+}
 
-        std::string line;
-        bool found_base = false;
-
-        while (std::getline(maps, line)) {
-            if (line.find("libil2cpp.so") == std::string::npos) {
-                continue;
-            }
-
-            // Target reading executable layout memory regions
-            if (line.find("r-xp") == std::string::npos && line.find("r--p") == std::string::npos) {
-                continue;
-            }
-
-            size_t dash = line.find('-');
-            if (dash == std::string::npos) continue;
-
-            std::string start_addr_str = line.substr(0, dash);
-            if (start_addr_str.empty()) continue;
-
-            // Simple hex check
-            bool is_valid_hex = true;
-            for (char c : start_addr_str) {
-                if (!isxdigit(static_cast<unsigned char>(c))) {
-                    is_valid_hex = false;
-                    break;
+std::string GetLibDir(JavaVM *vms) {
+    JNIEnv *env = nullptr;
+    vms->AttachCurrentThread(&env, nullptr);
+    jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
+    if (activity_thread_clz != nullptr) {
+        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
+                                                                "currentApplication",
+                                                                "()Landroid/app/Application;");
+        if (currentApplicationId) {
+            jobject application = env->CallStaticObjectMethod(activity_thread_clz,
+                                                              currentApplicationId);
+            jclass application_clazz = env->GetObjectClass(application);
+            if (application_clazz) {
+                jmethodID get_application_info = env->GetMethodID(application_clazz,
+                                                                  "getApplicationInfo",
+                                                                  "()Landroid/content/pm/ApplicationInfo;");
+                if (get_application_info) {
+                    jobject application_info = env->CallObjectMethod(application,
+                                                                     get_application_info);
+                    jfieldID native_library_dir_id = env->GetFieldID(
+                            env->GetObjectClass(application_info), "nativeLibraryDir",
+                            "Ljava/lang/String;");
+                    if (native_library_dir_id) {
+                        auto native_library_dir_jstring = (jstring) env->GetObjectField(
+                                application_info, native_library_dir_id);
+                        auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
+                        LOGI("lib dir %s", path);
+                        std::string lib_dir(path);
+                        env->ReleaseStringUTFChars(native_library_dir_jstring, path);
+                        return lib_dir;
+                    } else {
+                        LOGE("nativeLibraryDir not found");
+                    }
+                } else {
+                    LOGE("getApplicationInfo not found");
                 }
+            } else {
+                LOGE("application class not found");
             }
-            if (!is_valid_hex) continue;
-
-            char *endptr = nullptr;
-            errno = 0;
-            unsigned long long parsed_val = strtoull(start_addr_str.c_str(), &endptr, 16);
-            if (endptr == nullptr || *endptr != '\0' || errno == ERANGE) {
-                continue;
-            }
-
-            base_addr = static_cast<uintptr_t>(parsed_val);
-            LOGI("Perfare: Target library segment intercepted successfully: 0x%llx", (unsigned long long)base_addr);
-            found_base = true;
-            break;
+        } else {
+            LOGE("currentApplication not found");
         }
+    } else {
+        LOGE("ActivityThread not found");
+    }
+    return {};
+}
 
-        maps.close();
+static std::string GetNativeBridgeLibrary() {
+    auto value = std::array<char, PROP_VALUE_MAX>();
+    __system_property_get("ro.dalvik.vm.native.bridge", value.data());
+    return {value.data()};
+}
 
-        if (found_base && base_addr != 0) {
-            break;
-        }
+struct NativeBridgeCallbacks {
+    uint32_t version;
+    void *initialize;
+    void *(*loadLibrary)(const char *libpath, int flag);
+    void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
+    void *isSupported;
+    void *getAppEnv;
+    void *isCompatibleWith;
+    void *getSignalHandler;
+    void *unloadLibrary;
+    void *getError;
+    void *isPathSupported;
+    void *initAnonymousNamespace;
+    void *createNamespace;
+    void *linkNamespaces;
+    void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
+};
 
-        std::this_thread::sleep_for(POLL_INTERVAL);
+bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
+    sleep(5);
+
+    auto libart = dlopen("libart.so", RTLD_NOW);
+    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
+                                                                             "JNI_GetCreatedJavaVMs");
+    LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
+    JavaVM *vms_buf[1];
+    JavaVM *vms;
+    jsize num_vms;
+    jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
+    if (status == JNI_OK && num_vms > 0) {
+        vms = vms_buf[0];
+    } else {
+        LOGE("GetCreatedJavaVMs error");
+        return false;
     }
 
-    // Fixed 5-second settling block allowing Unity 6 translation engine tables to fully form
-    LOGI("Perfare: Holding dumper thread for 5000ms to achieve internal symbol initialization stability...");
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    auto lib_dir = GetLibDir(vms);
+    if (lib_dir.empty()) {
+        LOGE("GetLibDir error");
+        return false;
+    }
+    if (lib_dir.find("/lib/x86") != std::string::npos) {
+        LOGI("no need NativeBridge");
+        munmap(data, length);
+        return false;
+    }
 
-    LOGI("Perfare: Stability window complete. Kicking off dumper engine hooks at address: 0x%llx", (unsigned long long)base_addr);
-    il2cpp_api_init_from_base(base_addr);
-    
-    LOGI("Perfare: Running core extraction pipelines down to local directory files structures...");
-    il2cpp_dump(game_data_dir);
-    
-    LOGI("Perfare: SUCCESS! Memory map dump cycle finished cleanly.");
+    auto nb = dlopen("libhoudini.so", RTLD_NOW);
+    if (!nb) {
+        auto native_bridge = GetNativeBridgeLibrary();
+        LOGI("native bridge: %s", native_bridge.data());
+        nb = dlopen(native_bridge.data(), RTLD_NOW);
+    }
+    if (nb) {
+        LOGI("nb %p", nb);
+        auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
+        if (callbacks) {
+            LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
+            LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
+            LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
+
+            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
+            ftruncate(fd, (off_t) length);
+            void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
+            memcpy(mem, data, length);
+            munmap(mem, length);
+            munmap(data, length);
+            char path[PATH_MAX];
+            snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
+            LOGI("arm path %s", path);
+
+            void *arm_handle;
+            if (api_level >= 26) {
+                arm_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
+            } else {
+                arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
+            }
+            if (arm_handle) {
+                LOGI("arm handle %p", arm_handle);
+                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
+                                                                                  "JNI_OnLoad",
+                                                                                  nullptr, 0);
+                LOGI("JNI_OnLoad %p", init);
+                init(vms, (void *) game_data_dir);
+                return true;
+            }
+            close(fd);
+        }
+    }
+    return false;
 }
-
-// ---------------------------------------------------------------------------
-// Main System Entry Point Dispatches
-// ---------------------------------------------------------------------------
 
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("Perfare: Main entry sequence dispatch triggered.");
-    std::thread(hack_start_maps).detach();
+    LOGI("hack thread: %d", gettid());
+    int api_level = android_get_device_api_level();
+    LOGI("api level: %d", api_level);
+
+#if defined(__i386__) || defined(__x86_64__)
+    if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
+#endif
+        // FIX: Spawn as a detached thread natively to prevent blocking the engine launch
+        std::thread hack_thread(hack_start, STATIC_GAME_DATA_DIR);
+        hack_thread.detach();
+#if defined(__i386__) || defined(__x86_64__)
+    }
+#endif
 }
 
+#if defined(__arm__) || defined(__aarch64__)
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    LOGI("Perfare: Sub-runtime translation environment context triggered.");
-    std::thread(hack_start_maps).detach();
+    LOGI("Perfare: JNI_OnLoad fallback triggered via translator bridge context.");
+    // FIX: Pass the guaranteed STATIC_GAME_DATA_DIR string instead of the unstable 'reserved' pointer
+    std::thread hack_thread(hack_start, STATIC_GAME_DATA_DIR);
+    hack_thread.detach();
     return JNI_VERSION_1_6;
 }
+
+#endif
