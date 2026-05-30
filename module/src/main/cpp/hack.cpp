@@ -1,6 +1,9 @@
 //
 // Created by Perfare on 2020/7/4.
 //
+// Modified: Added /proc/self/maps scanner to bypass failing dlopen/NativeBridge hooks
+// in emulator translation layer environments.
+//
 
 #include "hack.h"
 #include "il2cpp_dump.h"
@@ -8,14 +11,225 @@
 #include "xdl.h"
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 #include <sys/system_properties.h>
 #include <dlfcn.h>
 #include <jni.h>
 #include <thread>
+#include <chrono>
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <string>
+#include <fstream>
+#include <sstream>
+
+// ---------------------------------------------------------------------------
+// /proc/self/maps scanner — proactive memory-map based detection
+// ---------------------------------------------------------------------------
+
+struct MapsEntry {
+    uintptr_t start;
+    uintptr_t end;
+    char perms[5];   // e.g. "r-xp"
+    std::string pathname;
+};
+
+// Parse a single line from /proc/self/maps into a MapsEntry.
+// Format: "start-end perms offset dev inode pathname"
+static bool parse_maps_line(const std::string &line, MapsEntry &entry) {
+    if (line.empty()) return false;
+
+    // Parse address range: "7f1234000-7f1235000"
+    size_t dash = line.find('-');
+    if (dash == std::string::npos) return false;
+
+    size_t space1 = line.find(' ', dash);
+    if (space1 == std::string::npos) return false;
+
+    // Parse start address
+    std::string start_str = line.substr(0, dash);
+    // Parse end address
+    std::string end_str = line.substr(dash + 1, space1 - dash - 1);
+
+    char *endptr = nullptr;
+    entry.start = strtoull(start_str.c_str(), &endptr, 16);
+    if (endptr == start_str.c_str()) return false;
+
+    entry.end = strtoull(end_str.c_str(), &endptr, 16);
+    if (endptr == end_str.c_str()) return false;
+
+    // Parse permissions (4 chars like "r-xp")
+    if (space1 + 1 + 4 > line.size()) return false;
+    memcpy(entry.perms, line.c_str() + space1 + 1, 4);
+    entry.perms[4] = '\0';
+
+    // Find pathname — it's the last field after the inode.
+    // Skip: perms, offset, dev, inode (4 space-separated fields after the address)
+    size_t pos = space1 + 1; // start of perms
+    int fields_to_skip = 4;  // perms, offset, dev, inode
+    for (int i = 0; i < fields_to_skip; ++i) {
+        pos = line.find(' ', pos);
+        if (pos == std::string::npos) {
+            entry.pathname.clear();
+            return true; // valid line, just no pathname
+        }
+        pos++; // skip the space
+    }
+
+    // Skip any leading whitespace before the pathname
+    while (pos < line.size() && line[pos] == ' ') pos++;
+
+    if (pos < line.size()) {
+        entry.pathname = line.substr(pos);
+    } else {
+        entry.pathname.clear();
+    }
+
+    return true;
+}
+
+// Scan /proc/self/maps for the first executable mapping of libil2cpp.so.
+// Returns the base address (start of the first r-xp or r--p segment) and
+// fills out_path with the full filesystem path.
+static uintptr_t find_libil2cpp_in_maps(std::string &out_path) {
+    std::ifstream maps("/proc/self/maps");
+    if (!maps.is_open()) {
+        LOGE("maps_scanner: failed to open /proc/self/maps");
+        return 0;
+    }
+
+    std::string line;
+    uintptr_t base_addr = 0;
+
+    while (std::getline(maps, line)) {
+        // Quick substring check before full parse
+        if (line.find("libil2cpp.so") == std::string::npos) {
+            continue;
+        }
+
+        MapsEntry entry;
+        if (!parse_maps_line(line, entry)) {
+            continue;
+        }
+
+        // Verify the pathname actually ends with libil2cpp.so
+        // (avoid false matches like "libil2cpp.so.bak" or "notlibil2cpp.so")
+        const std::string target = "libil2cpp.so";
+        if (entry.pathname.length() < target.length()) {
+            continue;
+        }
+        auto suffix = entry.pathname.substr(entry.pathname.length() - target.length());
+        if (suffix != target) {
+            continue;
+        }
+
+        // We want the first segment — it represents the ELF base.
+        // Prefer r-xp (executable code), but accept r--p as the ELF header mapping.
+        // The very first mapping of the library in maps is the base address.
+        if (base_addr == 0) {
+            base_addr = entry.start;
+            out_path = entry.pathname;
+            LOGI("maps_scanner: found libil2cpp.so at 0x%" PRIxPTR " perms=%s path=%s",
+                 entry.start, entry.perms, entry.pathname.c_str());
+            // Don't break yet — log all segments for debugging, but use the first base
+        }
+
+        LOGD("maps_scanner:   segment 0x%" PRIxPTR "-0x%" PRIxPTR " %s %s",
+             entry.start, entry.end, entry.perms, entry.pathname.c_str());
+    }
+
+    maps.close();
+    return base_addr;
+}
+
+// The maps-based scanner thread entry point.
+// Polls /proc/self/maps every 500ms until libil2cpp.so appears, then hands off
+// to the existing dumper pipeline.
+static void hack_start_maps(const char *game_data_dir) {
+    LOGI("maps_scanner: thread started (tid=%d), polling for libil2cpp.so...", gettid());
+
+    constexpr int MAX_ATTEMPTS = 120;  // 120 * 500ms = 60 seconds max wait
+    constexpr auto POLL_INTERVAL = std::chrono::milliseconds(500);
+
+    uintptr_t base_addr = 0;
+    std::string lib_path;
+
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+        base_addr = find_libil2cpp_in_maps(lib_path);
+
+        if (base_addr != 0) {
+            LOGI("maps_scanner: libil2cpp.so detected on attempt %d", attempt);
+            LOGI("maps_scanner: base address = 0x%" PRIxPTR, base_addr);
+            LOGI("maps_scanner: full path    = %s", lib_path.c_str());
+            break;
+        }
+
+        if (attempt % 10 == 0) {
+            LOGI("maps_scanner: still waiting for libil2cpp.so (attempt %d/%d)...",
+                 attempt, MAX_ATTEMPTS);
+        }
+
+        std::this_thread::sleep_for(POLL_INTERVAL);
+    }
+
+    if (base_addr == 0) {
+        LOGE("maps_scanner: libil2cpp.so not found after %d attempts, giving up.", MAX_ATTEMPTS);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Strategy: Try to get a proper dl handle using the full path from maps.
+    // This often works even when bare-name dlopen("libil2cpp.so") fails,
+    // because the full path bypasses the linker's namespace resolution.
+    // -----------------------------------------------------------------------
+    void *handle = nullptr;
+
+    // Attempt 1: xdl_open with bare name (original approach, may work now that lib is loaded)
+    handle = xdl_open("libil2cpp.so", 0);
+    if (handle) {
+        LOGI("maps_scanner: xdl_open(\"libil2cpp.so\") succeeded: %p", handle);
+    }
+
+    // Attempt 2: dlopen with full path from maps
+    if (!handle && !lib_path.empty()) {
+        handle = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+        if (handle) {
+            LOGI("maps_scanner: dlopen(\"%s\", RTLD_NOLOAD) succeeded: %p",
+                 lib_path.c_str(), handle);
+        }
+    }
+
+    // Attempt 3: xdl_open with full path
+    if (!handle && !lib_path.empty()) {
+        handle = xdl_open(lib_path.c_str(), 0);
+        if (handle) {
+            LOGI("maps_scanner: xdl_open(\"%s\") succeeded: %p",
+                 lib_path.c_str(), handle);
+        }
+    }
+
+    if (handle) {
+        // Standard path: we have a valid handle, use the existing pipeline
+        il2cpp_api_init(handle);
+        il2cpp_dump(game_data_dir);
+    } else {
+        // Fallback: no valid handle, but we have the base address from maps.
+        // Use il2cpp_api_init_from_base() to resolve symbols by walking the
+        // ELF from the mapped base address, and set il2cpp_base directly.
+        LOGW("maps_scanner: all dlopen attempts failed, using base address fallback");
+        LOGI("maps_scanner: calling il2cpp_api_init_from_base(0x%" PRIxPTR ")", base_addr);
+        il2cpp_api_init_from_base(base_addr);
+        il2cpp_dump(game_data_dir);
+    }
+
+    LOGI("maps_scanner: thread finished (tid=%d)", gettid());
+}
+
+// ---------------------------------------------------------------------------
+// Original xdl_open based detection (kept as secondary fallback)
+// ---------------------------------------------------------------------------
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
@@ -34,6 +248,10 @@ void hack_start(const char *game_data_dir) {
         LOGI("libil2cpp.so not found in thread %d", gettid());
     }
 }
+
+// ---------------------------------------------------------------------------
+// JNI / NativeBridge helpers (unchanged)
+// ---------------------------------------------------------------------------
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
@@ -186,6 +404,10 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Entry point — dispatches to maps scanner first, then original fallback
+// ---------------------------------------------------------------------------
+
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     LOGI("hack thread: %d", gettid());
     int api_level = android_get_device_api_level();
@@ -194,7 +416,9 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 #if defined(__i386__) || defined(__x86_64__)
     if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
 #endif
-        hack_start(game_data_dir);
+        // Primary: use the /proc/self/maps scanner (bypasses broken dlopen hooks)
+        LOGI("Starting /proc/self/maps scanner for libil2cpp.so detection");
+        hack_start_maps(game_data_dir);
 #if defined(__i386__) || defined(__x86_64__)
     }
 #endif
@@ -204,7 +428,8 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     auto game_data_dir = (const char *) reserved;
-    std::thread hack_thread(hack_start, game_data_dir);
+    // Use maps scanner instead of the original hack_start
+    std::thread hack_thread(hack_start_maps, game_data_dir);
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }

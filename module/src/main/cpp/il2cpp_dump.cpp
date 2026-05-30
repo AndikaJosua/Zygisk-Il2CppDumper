@@ -1,6 +1,10 @@
 //
 // Created by Perfare on 2020/7/4.
 //
+// Modified: Added il2cpp_api_init_from_base() for /proc/self/maps scanner fallback.
+// This allows resolving il2cpp API symbols directly from the ELF loaded in memory
+// when dlopen/xdl_open cannot produce a valid handle.
+//
 
 #include "il2cpp_dump.h"
 #include <dlfcn.h>
@@ -12,6 +16,7 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <elf.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -37,6 +42,185 @@ void init_il2cpp_api(void *handle) {
 
 #undef DO_API
 }
+
+// ---------------------------------------------------------------------------
+// ELF symbol resolution from mapped base address
+// ---------------------------------------------------------------------------
+
+#if defined(__LP64__)
+using ElfW_Ehdr = Elf64_Ehdr;
+using ElfW_Phdr = Elf64_Phdr;
+using ElfW_Shdr = Elf64_Shdr;
+using ElfW_Sym  = Elf64_Sym;
+using ElfW_Dyn  = Elf64_Dyn;
+#define ELFW_ST_TYPE ELF64_ST_TYPE
+#else
+using ElfW_Ehdr = Elf32_Ehdr;
+using ElfW_Phdr = Elf32_Phdr;
+using ElfW_Shdr = Elf32_Shdr;
+using ElfW_Sym  = Elf32_Sym;
+using ElfW_Dyn  = Elf32_Dyn;
+#define ELFW_ST_TYPE ELF32_ST_TYPE
+#endif
+
+// Walk the ELF's dynamic section to find the symbol table and string table,
+// then look up a symbol by name. Returns its absolute address in memory.
+static void *elf_lookup_symbol(uintptr_t base, const char *name) {
+    auto ehdr = reinterpret_cast<ElfW_Ehdr *>(base);
+
+    // Validate ELF magic
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
+        LOGE("elf_lookup: invalid ELF magic at base 0x%" PRIxPTR, base);
+        return nullptr;
+    }
+
+    // Find the PT_DYNAMIC segment
+    auto phdr = reinterpret_cast<ElfW_Phdr *>(base + ehdr->e_phoff);
+    ElfW_Dyn *dyn_section = nullptr;
+
+    for (int i = 0; i < ehdr->e_phnum; ++i) {
+        if (phdr[i].p_type == PT_DYNAMIC) {
+            dyn_section = reinterpret_cast<ElfW_Dyn *>(base + phdr[i].p_vaddr);
+            break;
+        }
+    }
+
+    if (!dyn_section) {
+        LOGE("elf_lookup: PT_DYNAMIC not found");
+        return nullptr;
+    }
+
+    // Extract DT_SYMTAB, DT_STRTAB, DT_HASH or DT_GNU_HASH for symbol count
+    ElfW_Sym *symtab = nullptr;
+    const char *strtab = nullptr;
+    uint32_t *hashtab = nullptr;     // DT_HASH
+    uint32_t *gnu_hashtab = nullptr; // DT_GNU_HASH
+    size_t sym_count = 0;
+
+    for (ElfW_Dyn *dyn = dyn_section; dyn->d_tag != DT_NULL; ++dyn) {
+        switch (dyn->d_tag) {
+            case DT_SYMTAB:
+                symtab = reinterpret_cast<ElfW_Sym *>(base + dyn->d_un.d_ptr);
+                break;
+            case DT_STRTAB:
+                strtab = reinterpret_cast<const char *>(base + dyn->d_un.d_ptr);
+                break;
+            case DT_HASH:
+                hashtab = reinterpret_cast<uint32_t *>(base + dyn->d_un.d_ptr);
+                break;
+            case DT_GNU_HASH:
+                gnu_hashtab = reinterpret_cast<uint32_t *>(base + dyn->d_un.d_ptr);
+                break;
+        }
+    }
+
+    if (!symtab || !strtab) {
+        LOGE("elf_lookup: SYMTAB or STRTAB not found");
+        return nullptr;
+    }
+
+    // Determine symbol count from hash table
+    if (hashtab) {
+        // DT_HASH format: [ nbucket, nchain, ... ]
+        // nchain == number of symbols
+        sym_count = hashtab[1];
+    } else if (gnu_hashtab) {
+        // GNU hash: we need to walk the buckets to find the max symbol index.
+        // Format: [ nbuckets, symndx, maskwords, shift2, bloom[], buckets[], chains[] ]
+        uint32_t nbuckets = gnu_hashtab[0];
+        uint32_t symndx = gnu_hashtab[1];
+        uint32_t maskwords = gnu_hashtab[2];
+        // uint32_t shift2 = gnu_hashtab[3]; // unused here
+
+        // bloom filter is after the 4 header words
+        // buckets are after bloom filter
+        auto buckets = reinterpret_cast<uint32_t *>(
+            reinterpret_cast<uintptr_t>(gnu_hashtab) +
+            4 * sizeof(uint32_t) +
+            maskwords * sizeof(uintptr_t));  // bloom uses native pointer size
+
+        // Find the maximum bucket value — the highest starting symbol index
+        uint32_t max_bucket = 0;
+        for (uint32_t i = 0; i < nbuckets; ++i) {
+            if (buckets[i] > max_bucket) {
+                max_bucket = buckets[i];
+            }
+        }
+
+        if (max_bucket == 0) {
+            // All buckets empty, no symbols
+            sym_count = symndx;
+        } else {
+            // Walk the chain from max_bucket to find the last symbol
+            auto chains = buckets + nbuckets;
+            uint32_t idx = max_bucket;
+            while (!(chains[idx - symndx] & 1)) {
+                idx++;
+            }
+            sym_count = idx + 1;
+        }
+    } else {
+        // No hash table — use a reasonable upper bound.
+        // This is a last-resort fallback; in practice ELFs always have a hash table.
+        LOGW("elf_lookup: no hash table found, using estimated symbol count");
+        sym_count = 65536; // generous upper bound
+    }
+
+    // Linear search through the symbol table
+    for (size_t i = 0; i < sym_count; ++i) {
+        if (symtab[i].st_name == 0) continue;
+        if (ELFW_ST_TYPE(symtab[i].st_info) != STT_FUNC &&
+            ELFW_ST_TYPE(symtab[i].st_info) != STT_OBJECT) {
+            continue;
+        }
+        if (symtab[i].st_shndx == SHN_UNDEF) continue;
+
+        const char *sym_name = strtab + symtab[i].st_name;
+        if (strcmp(sym_name, name) == 0) {
+            return reinterpret_cast<void *>(base + symtab[i].st_value);
+        }
+    }
+
+    return nullptr;
+}
+
+// Initialize all il2cpp API functions by resolving symbols directly from the
+// ELF mapped at the given base address. Used when dlopen/xdl_open fail.
+void il2cpp_api_init_from_base(uintptr_t base) {
+    LOGI("il2cpp_api_init_from_base: base=0x%" PRIxPTR, base);
+    il2cpp_base = static_cast<uint64_t>(base);
+
+#define DO_API(r, n, p) {                                               \
+    n = (r (*) p)elf_lookup_symbol(base, #n);                           \
+    if(!n) {                                                            \
+        LOGW("api not found (elf_lookup) %s", #n);                      \
+    } else {                                                            \
+        LOGD("resolved %s -> %p", #n, (void*)n);                        \
+    }                                                                   \
+}
+
+#include "il2cpp-api-functions.h"
+
+#undef DO_API
+
+    if (!il2cpp_domain_get_assemblies) {
+        LOGE("il2cpp_api_init_from_base: critical API il2cpp_domain_get_assemblies not resolved");
+        return;
+    }
+
+    LOGI("il2cpp_base: %" PRIx64, il2cpp_base);
+
+    while (!il2cpp_is_vm_thread(nullptr)) {
+        LOGI("Waiting for il2cpp_init...");
+        sleep(1);
+    }
+    auto domain = il2cpp_domain_get();
+    il2cpp_thread_attach(domain);
+}
+
+// ---------------------------------------------------------------------------
+// Original API init (uses xdl_sym, kept intact)
+// ---------------------------------------------------------------------------
 
 std::string get_method_modifier(uint32_t flags) {
     std::stringstream outPut;
