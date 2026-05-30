@@ -16,22 +16,31 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <string>
+
+// Fixed target destination to bypass unverified pointer parsing in the translator
+const char *STATIC_GAME_DATA_DIR = "/data/data/com.kukouri.wizworld/files";
 
 void hack_start(const char *game_data_dir) {
+    LOGI("Perfare: Dumper thread active (tid=%d). Searching for libil2cpp.so...", gettid());
     bool load = false;
-    for (int i = 0; i < 10; i++) {
+    
+    // Extended to 20 attempts to give Unity 6 ample time to unpack under translation layers
+    for (int i = 0; i < 20; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
+            LOGI("Perfare: libil2cpp.so found via xdl_open! Initializing core pipeline...");
             il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
+            il2cpp_dump(STATIC_GAME_DATA_DIR);
+            LOGI("Perfare: SUCCESS! Extraction completed cleanly.");
             break;
         } else {
             sleep(1);
         }
     }
     if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
+        LOGE("Perfare: libil2cpp.so not found in thread %d after timeout.", gettid());
     }
 }
 
@@ -92,11 +101,8 @@ static std::string GetNativeBridgeLibrary() {
 struct NativeBridgeCallbacks {
     uint32_t version;
     void *initialize;
-
     void *(*loadLibrary)(const char *libpath, int flag);
-
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
-
     void *isSupported;
     void *getAppEnv;
     void *isCompatibleWith;
@@ -107,12 +113,10 @@ struct NativeBridgeCallbacks {
     void *initAnonymousNamespace;
     void *createNamespace;
     void *linkNamespaces;
-
     void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    //TODO 等待houdini初始化
     sleep(5);
 
     auto libart = dlopen("libart.so", RTLD_NOW);
@@ -194,7 +198,9 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 #if defined(__i386__) || defined(__x86_64__)
     if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
 #endif
-        hack_start(game_data_dir);
+        // FIX: Spawn as a detached thread natively to prevent blocking the engine launch
+        std::thread hack_thread(hack_start, STATIC_GAME_DATA_DIR);
+        hack_thread.detach();
 #if defined(__i386__) || defined(__x86_64__)
     }
 #endif
@@ -203,8 +209,9 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 #if defined(__arm__) || defined(__aarch64__)
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    auto game_data_dir = (const char *) reserved;
-    std::thread hack_thread(hack_start, game_data_dir);
+    LOGI("Perfare: JNI_OnLoad fallback triggered via translator bridge context.");
+    // FIX: Pass the guaranteed STATIC_GAME_DATA_DIR string instead of the unstable 'reserved' pointer
+    std::thread hack_thread(hack_start, STATIC_GAME_DATA_DIR);
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }
