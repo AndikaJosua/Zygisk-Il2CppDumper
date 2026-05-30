@@ -128,7 +128,7 @@ static void hack_start_maps(const char *game_data_dir) {
             }
 
             base_addr = static_cast<uintptr_t>(parsed_val);
-            LOGI("Perfare: Memory address parsed successfully. Hex representation: 0x%" PRIxPTR, base_addr);
+            LOGI("Perfare: Memory address parsed successfully. Hex representation: 0x%llx", (unsigned long long)base_addr);
             found_base = true;
             break;
         }
@@ -145,7 +145,7 @@ static void hack_start_maps(const char *game_data_dir) {
     }
 
     // Pass that base address value directly into our codebase's existing core dumping function to kick off the extraction process.
-    LOGI("Perfare: Starting core dumping/extraction with base address 0x%" PRIxPTR, base_addr);
+    LOGI("Perfare: Starting core dumping/extraction with base address 0x%llx", (unsigned long long)base_addr);
     il2cpp_api_init_from_base(base_addr);
     il2cpp_dump(data_dir.c_str());
     LOGI("Perfare: Extraction process completed.");
