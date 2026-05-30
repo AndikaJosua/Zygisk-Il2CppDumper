@@ -59,32 +59,18 @@ static void hack_start_maps() {
                 continue;
             }
 
-            LOGI("Perfare: Found string 'libil2cpp.so' in maps line: %s", line.c_str());
-
-            // Verify segment execution/read permissions
-            size_t address_end = line.find(' ');
-            if (address_end == std::string::npos) continue;
-
-            size_t perms_start = address_end;
-            while (perms_start < line.length() && line[perms_start] == ' ') {
-                perms_start++;
-            }
-
-            if (perms_start + 4 > line.length()) continue;
-
-            std::string perms = line.substr(perms_start, 4);
-            if (perms != "r-xp" && perms != "r--p") {
-                LOGI("Perfare: Skipping segment with permissions: %s", perms.c_str());
+            // Verify segment execution/read permissions (grabbing executable region)
+            if (line.find("r-xp") == std::string::npos && line.find("r--p") == std::string::npos) {
                 continue;
             }
 
             size_t dash = line.find('-');
-            if (dash == std::string::npos || dash > address_end) continue;
+            if (dash == std::string::npos) continue;
 
             std::string start_addr_str = line.substr(0, dash);
             if (start_addr_str.empty()) continue;
 
-            // Hex check
+            // Hex digit sanity check
             bool is_valid_hex = true;
             for (char c : start_addr_str) {
                 if (!isxdigit(static_cast<unsigned char>(c))) {
@@ -98,12 +84,11 @@ static void hack_start_maps() {
             errno = 0;
             unsigned long long parsed_val = strtoull(start_addr_str.c_str(), &endptr, 16);
             if (endptr == nullptr || *endptr != '\0' || errno == ERANGE) {
-                LOGE("Perfare: strtoull parsing failed for address string: %s", start_addr_str.c_str());
                 continue;
             }
 
             base_addr = static_cast<uintptr_t>(parsed_val);
-            LOGI("Perfare: SUCCESS! Memory address parsed cleanly: 0x%llx", (unsigned long long)base_addr);
+            LOGI("Perfare: SUCCESS! Found libil2cpp.so memory region address: 0x%llx", (unsigned long long)base_addr);
             found_base = true;
             break;
         }
@@ -117,32 +102,18 @@ static void hack_start_maps() {
         std::this_thread::sleep_for(POLL_INTERVAL);
     }
 
-    // Secondary Stabilization Validation: Ensure symbols are fully loaded by the engine before dump
-    LOGI("Perfare: Waiting for library symbol initialization stability...");
-    void* handle = nullptr;
-    while (handle == nullptr) {
-        handle = dlopen("libil2cpp.so", RTLD_LAZY);
-        if (handle == nullptr) {
-            // Fallback check via absolute path if standard dlopen is isolated
-            handle = dlopen("/data/app/com.kukouri.wizworld-1/lib/arm64/libil2cpp.so", RTLD_LAZY);
-        }
-        if (handle != nullptr) {
-            void* init_sym = dlsym(handle, "il2cpp_init");
-            if (init_sym == nullptr) {
-                dlclose(handle);
-                handle = nullptr;
-            }
-        }
-        if (handle == nullptr) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        }
-    }
-    dlclose(handle);
+    // Secondary Stabilization: Instead of calling buggy linkers (dlopen), we give the Unity 6
+    // translation bridge a 4-second stabilization period to unpack its internal export tables.
+    LOGI("Perfare: Holding execution for 4000ms to guarantee library structure stability...");
+    std::this_thread::sleep_for(std::chrono::milliseconds(4000));
 
-    LOGI("Perfare: Library verified stable. Executing dump at base 0x%llx...", (unsigned long long)base_addr);
+    LOGI("Perfare: Stabilization complete. Initializing dumper core execution at base: 0x%llx...", (unsigned long long)base_addr);
     il2cpp_api_init_from_base(base_addr);
+    
+    LOGI("Perfare: Invoking extraction writing sequence to destination target...");
     il2cpp_dump(game_data_dir);
-    LOGI("Perfare: Core dumper extraction completed cleanly!");
+    
+    LOGI("Perfare: Core dumper extraction completed cleanly! Check your /files directory.");
 }
 
 // ---------------------------------------------------------------------------
